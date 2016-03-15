@@ -1,3 +1,15 @@
+This is a fork of the upstream.
+
+I was constantly annoyed that 'continue' would exit the network
+session. Now the session is maintained using a global variable. Yep,
+it's a hack but a useful one. If there is really a need for starting a
+new connection each time the trace is triggered the code supports a
+`maintain_session` parameter. If False a new session is started each
+time and 'continue' ends the current one.
+
+This tree now has 'with' statements so it will only work on Python
+2.6+. I have not tried it with Jython.
+
 rpdb - remote debugger based on pdb
 ===================================
 
