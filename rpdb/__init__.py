@@ -1,15 +1,16 @@
 """Remote Python Debugger (pdb wrapper)."""
 
 __author__ = "Bertrand Janin <b@janin.com>"
-__version__ = "0.1.6"
+__version__ = "0.1.6.shaleh"
 
-import pdb
-import socket
-import threading
-import signal
-import sys
-import traceback
+
 from functools import partial
+import pdb
+import signal
+import socket
+import sys
+import threading
+import traceback
 
 DEFAULT_ADDR = "127.0.0.1"
 DEFAULT_PORT = 4444
@@ -22,18 +23,19 @@ class FileObjectWrapper(object):
 
     def __getattr__(self, attr):
         if hasattr(self._obj, attr):
-            attr = getattr(self._obj, attr)
+            return getattr(self._obj, attr)
         elif hasattr(self._io, attr):
-            attr = getattr(self._io, attr)
+            return getattr(self._io, attr)
         else:
-            raise AttributeError("Attribute %s is not found" % attr)
-        return attr
+            # this will raise the same AttributeError as if this method
+            # was never called.
+            return self.__getattribute__(attr)
 
 
-class Rpdb(pdb.Pdb):
+class RpdbSession(object):
 
-    def __init__(self, addr=DEFAULT_ADDR, port=DEFAULT_PORT):
-        """Initialize the socket and initialize pdb."""
+    def __init__(self, addr, port):
+        """Initialize the socket."""
 
         # Backup stdin and stdout before replacing them by the socket handle
         self.old_stdout = sys.stdout
@@ -54,12 +56,9 @@ class Rpdb(pdb.Pdb):
             pass
 
         (clientsocket, address) = self.skt.accept()
-        handle = clientsocket.makefile('rw')
-        pdb.Pdb.__init__(self, completekey='tab',
-                         stdin=FileObjectWrapper(handle, self.old_stdin),
-                         stdout=FileObjectWrapper(handle, self.old_stdin))
-        sys.stdout = sys.stdin = handle
-        OCCUPIED.claim(port, sys.stdout)
+        self.handle = clientsocket.makefile('rw')
+        sys.stdout = sys.stdin = self.handle
+        OCCUPIED.claim(port, self.handle)
 
     def shutdown(self):
         """Revert stdin and stdout, close the socket."""
@@ -68,19 +67,30 @@ class Rpdb(pdb.Pdb):
         OCCUPIED.unclaim(self.port)
         self.skt.close()
 
+
+class Rpdb(object):
+    def __init__(self, session):
+        self._session = session
+
+        self.pdb = pdb.Pdb(completekey='tab',
+                           stdin=FileObjectWrapper(self._session.handle, self._session.old_stdin),
+                           stdout=FileObjectWrapper(self._session.handle, self._session.old_stdout))
+
+    def shutdown(self):
+        self._session.shutdown()
+        self._session = None
+
     def do_continue(self, arg):
         """Clean-up and do underlying continue."""
-        try:
-            return pdb.Pdb.do_continue(self, arg)
-        finally:
-            self.shutdown()
+        # left here because maybe I want to have a toggle for quitting...
+        return self.pdb.do_continue(self, arg)
 
     do_c = do_cont = do_continue
 
     def do_quit(self, arg):
         """Clean-up and do underlying quit."""
         try:
-            return pdb.Pdb.do_quit(self, arg)
+            return self.pdb.do_quit(self, arg)
         finally:
             self.shutdown()
 
@@ -89,19 +99,34 @@ class Rpdb(pdb.Pdb):
     def do_EOF(self, arg):
         """Clean-up and do underlying EOF."""
         try:
-            return pdb.Pdb.do_EOF(self, arg)
+            return self.pdb.do_EOF(self, arg)
         finally:
             self.shutdown()
 
+    def __getattr__(self, name):
+        if not hasattr(self.pdb, name):
+            return self.__getattribute__(name)
+        return getattr(self.pdb, name)
 
-def set_trace(addr=DEFAULT_ADDR, port=DEFAULT_PORT, frame=None):
+
+_GLOBAL_RPDB_SESSION = None
+
+
+def set_trace(addr=DEFAULT_ADDR, port=DEFAULT_PORT, frame=None, maintain_session=True):
     """Wrapper function to keep the same import x; x.set_trace() interface.
 
     We catch all the possible exceptions from pdb and cleanup.
 
     """
+    global _GLOBAL_RPDB_SESSION
     try:
-        debugger = Rpdb(addr=addr, port=port)
+        if maintain_session:
+            if _GLOBAL_RPDB_SESSION is None:
+                _GLOBAL_RPDB_SESSION = RpdbSession(addr=addr, port=port)
+            session = _GLOBAL_RPDB_SESSION
+        else:
+            session = RpdbSession(addr=addr, port=port)
+        debugger = Rpdb(session)
     except socket.error:
         if OCCUPIED.is_claimed(port, sys.stdout):
             # rpdb is already on this port - good enough, let it go on:
@@ -126,7 +151,8 @@ def handle_trap(addr=DEFAULT_ADDR, port=DEFAULT_PORT):
 
 
 def post_mortem(addr=DEFAULT_ADDR, port=DEFAULT_PORT):
-    debugger = Rpdb(addr=addr, port=port)
+    session = RpdbSession(addr=addr, port=port)
+    debugger = Rpdb(session)
     type, value, tb = sys.exc_info()
     traceback.print_exc()
     debugger.reset()
@@ -148,20 +174,16 @@ class OccupiedPorts(object):
         self.claims = {}
 
     def claim(self, port, handle):
-        self.lock.acquire(True)
-        self.claims[port] = id(handle)
-        self.lock.release()
+        with self.lock:
+            self.claims[port] = id(handle)
 
     def is_claimed(self, port, handle):
-        self.lock.acquire(True)
-        got = (self.claims.get(port) == id(handle))
-        self.lock.release()
-        return got
+        with self.lock:
+            return (self.claims.get(port) == id(handle))
 
     def unclaim(self, port):
-        self.lock.acquire(True)
-        del self.claims[port]
-        self.lock.release()
+        with self.lock:
+            del self.claims[port]
 
 # {port: sys.stdout} pairs to track recursive rpdb invocation on same port.
 # This scheme doesn't interfere with recursive invocations on separate ports -
