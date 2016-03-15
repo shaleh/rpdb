@@ -17,6 +17,10 @@ DEFAULT_PORT = 4444
 
 
 class FileObjectWrapper(object):
+    """Wrap a file object with an IO object.
+
+    Treat the two objects as one object, preferring the file when accessing attributes.
+    """
     def __init__(self, fileobject, stdio):
         self._obj = fileobject
         self._io = stdio
@@ -33,10 +37,8 @@ class FileObjectWrapper(object):
 
 
 class RpdbSession(object):
-
+    """Network session for rpdb."""
     def __init__(self, addr, port):
-        """Initialize the socket."""
-
         # Backup stdin and stdout before replacing them by the socket handle
         self.old_stdout = sys.stdout
         self.old_stdin = sys.stdin
@@ -55,7 +57,7 @@ class RpdbSession(object):
         except IOError:
             pass
 
-        (clientsocket, address) = self.skt.accept()
+        (clientsocket, _) = self.skt.accept()
         self.handle = clientsocket.makefile('rw')
         sys.stdout = sys.stdin = self.handle
         OCCUPIED.claim(port, self.handle)
@@ -69,6 +71,10 @@ class RpdbSession(object):
 
 
 class Rpdb(object):
+    """Stand-in for a PDB object enabling remote debugging.
+
+    A socket is maintained by the session. All interaction is handled by the PDB instance.
+    """
     def __init__(self, session):
         self._session = session
 
@@ -77,29 +83,23 @@ class Rpdb(object):
                            stdout=FileObjectWrapper(self._session.handle, self._session.old_stdout))
 
     def shutdown(self):
+        """Close the session."""
         self._session.shutdown()
         self._session = None
 
-    def do_continue(self, arg):
-        """Clean-up and do underlying continue."""
-        # left here because maybe I want to have a toggle for quitting...
-        return self.pdb.do_continue(self, arg)
-
-    do_c = do_cont = do_continue
-
     def do_quit(self, arg):
-        """Clean-up and do underlying quit."""
+        """Do PDB quit and then clean-up."""
         try:
-            return self.pdb.do_quit(self, arg)
+            return self.pdb.do_quit(arg)
         finally:
             self.shutdown()
 
     do_q = do_exit = do_quit
 
     def do_EOF(self, arg):
-        """Clean-up and do underlying EOF."""
+        """Do PDB EOF and then clean-up."""
         try:
-            return self.pdb.do_EOF(self, arg)
+            return self.pdb.do_EOF(arg)
         finally:
             self.shutdown()
 
@@ -116,7 +116,6 @@ def set_trace(addr=DEFAULT_ADDR, port=DEFAULT_PORT, frame=None, maintain_session
     """Wrapper function to keep the same import x; x.set_trace() interface.
 
     We catch all the possible exceptions from pdb and cleanup.
-
     """
     global _GLOBAL_RPDB_SESSION
     try:
@@ -141,7 +140,8 @@ def set_trace(addr=DEFAULT_ADDR, port=DEFAULT_PORT, frame=None, maintain_session
         traceback.print_exc()
 
 
-def _trap_handler(addr, port, signum, frame):
+def _trap_handler(addr, port, _, frame):
+    """Trap handling callback function."""
     set_trace(addr, port, frame=frame)
 
 
@@ -151,9 +151,13 @@ def handle_trap(addr=DEFAULT_ADDR, port=DEFAULT_PORT):
 
 
 def post_mortem(addr=DEFAULT_ADDR, port=DEFAULT_PORT):
+    """Post mortem handler.
+
+    Place this in a try/except handler.
+    """
     session = RpdbSession(addr=addr, port=port)
     debugger = Rpdb(session)
-    type, value, tb = sys.exc_info()
+    _, _, tb = sys.exc_info()
     traceback.print_exc()
     debugger.reset()
     debugger.interaction(None, tb)
@@ -174,14 +178,17 @@ class OccupiedPorts(object):
         self.claims = {}
 
     def claim(self, port, handle):
+        """Claim a (port, handle) pair."""
         with self.lock:
             self.claims[port] = id(handle)
 
     def is_claimed(self, port, handle):
+        """Is (port, handle) claimed?"""
         with self.lock:
-            return (self.claims.get(port) == id(handle))
+            return self.claims.get(port) == id(handle)
 
     def unclaim(self, port):
+        """Release a (port, handle) pair."""
         with self.lock:
             del self.claims[port]
 
