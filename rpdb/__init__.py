@@ -5,6 +5,7 @@ __version__ = "0.1.6.shaleh"
 
 
 from functools import partial
+import logging
 import pdb
 import signal
 import socket
@@ -15,25 +16,26 @@ import traceback
 DEFAULT_ADDR = "127.0.0.1"
 DEFAULT_PORT = 4444
 
+_logger = logging.getLogger(__name__)
+_logger.addHandler(logging.NullHandler())
 
-class FileObjectWrapper(object):
-    """Wrap a file object with an IO object.
 
-    Treat the two objects as one object, preferring the file when accessing attributes.
+class UnifiedObjects(object):
+    """Present a unified interface to all objects provided.
+
+    Treat the objects as one object, accessing attributes in the order
+    the objects are given at initialization.
     """
-    def __init__(self, fileobject, stdio):
-        self._obj = fileobject
-        self._io = stdio
+    def __init__(self, *args):
+        self._objs = args
 
-    def __getattr__(self, attr):
-        if hasattr(self._obj, attr):
-            return getattr(self._obj, attr)
-        elif hasattr(self._io, attr):
-            return getattr(self._io, attr)
-        else:
-            # this will raise the same AttributeError as if this method
-            # was never called.
-            return self.__getattribute__(attr)
+    def __getattr__(self, name):
+        for o in self._objs:
+            if hasattr(o, name):
+                return getattr(o, name)
+        # this will raise the same AttributeError as if this method
+        # was never called.
+        return self.__getattribute__(name)
 
 
 class RpdbSession(object):
@@ -44,18 +46,14 @@ class RpdbSession(object):
         self.old_stdin = sys.stdin
         self.port = port
 
-        # Open a 'reusable' socket to let the webapp reload on the same port
+        # Open a 'reusable' socket to let the debugging session reuse the port
         self.skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         self.skt.bind((addr, port))
         self.skt.listen(1)
 
         # Writes to stdout are forbidden in mod_wsgi environments
-        try:
-            sys.stderr.write("pdb is running on %s:%d\n"
-                             % self.skt.getsockname())
-        except IOError:
-            pass
+        _logger.info("session created on %s:%d", *self.skt.getsockname())
 
         (clientsocket, _) = self.skt.accept()
         self.handle = clientsocket.makefile('rw')
@@ -64,10 +62,19 @@ class RpdbSession(object):
 
     def shutdown(self):
         """Revert stdin and stdout, close the socket."""
-        sys.stdout = self.old_stdout
-        sys.stdin = self.old_stdin
-        OCCUPIED.unclaim(self.port)
-        self.skt.close()
+        if self.old_stdout and self.old_stdin:
+            sys.stdout = self.old_stdout
+            sys.stdin = self.old_stdin
+        if self.port:
+            OCCUPIED.unclaim(self.port)
+        if self.skt:
+            _logger.debug("session ending")
+            self.skt.close()
+
+        self.old_stdout = None
+        self.old_stdin = None
+        self.skt = None
+        self.port = None
 
 
 class Rpdb(object):
@@ -77,36 +84,16 @@ class Rpdb(object):
     """
     def __init__(self, session):
         self._session = session
-
         self.pdb = pdb.Pdb(completekey='tab',
-                           stdin=FileObjectWrapper(self._session.handle, self._session.old_stdin),
-                           stdout=FileObjectWrapper(self._session.handle, self._session.old_stdout))
+                           stdin=UnifiedObjects(self._session.handle, self._session.old_stdin),
+                           stdout=UnifiedObjects(self._session.handle, self._session.old_stdout))
 
-    def shutdown(self):
-        """Close the session."""
-        self._session.shutdown()
-        self._session = None
-
-    def do_quit(self, arg):
-        """Do PDB quit and then clean-up."""
-        try:
-            return self.pdb.do_quit(arg)
-        finally:
-            self.shutdown()
-
-    do_q = do_exit = do_quit
-
-    def do_EOF(self, arg):
-        """Do PDB EOF and then clean-up."""
-        try:
-            return self.pdb.do_EOF(arg)
-        finally:
-            self.shutdown()
+        _logger.debug("new PDB instance")
 
     def __getattr__(self, name):
-        if not hasattr(self.pdb, name):
-            return self.__getattribute__(name)
-        return getattr(self.pdb, name)
+        if hasattr(self.pdb, name):
+            return getattr(self.pdb, name)
+        return self.__getattribute__(name)
 
 
 _GLOBAL_RPDB_SESSION = None
@@ -118,13 +105,14 @@ def set_trace(addr=DEFAULT_ADDR, port=DEFAULT_PORT, frame=None, maintain_session
     We catch all the possible exceptions from pdb and cleanup.
     """
     global _GLOBAL_RPDB_SESSION
+    if maintain_session:
+        if _GLOBAL_RPDB_SESSION is None:
+            _GLOBAL_RPDB_SESSION = RpdbSession(addr=addr, port=port)
+        session = _GLOBAL_RPDB_SESSION
+    else:
+        session = RpdbSession(addr=addr, port=port)
+
     try:
-        if maintain_session:
-            if _GLOBAL_RPDB_SESSION is None:
-                _GLOBAL_RPDB_SESSION = RpdbSession(addr=addr, port=port)
-            session = _GLOBAL_RPDB_SESSION
-        else:
-            session = RpdbSession(addr=addr, port=port)
         debugger = Rpdb(session)
     except socket.error:
         if OCCUPIED.is_claimed(port, sys.stdout):
