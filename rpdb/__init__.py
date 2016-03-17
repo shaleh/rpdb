@@ -38,43 +38,108 @@ class UnifiedObjects(object):
         return self.__getattribute__(name)
 
 
+_GLOBAL_RPDB_SESSION = None
+
+
+def new_session(*args, **kwargs):
+    global _GLOBAL_RPDB_SESSION
+
+    ephemeral = kwargs.pop("ephemeral")
+    if ephemeral:
+        return RpdbSession(*args, **kwargs)
+
+    if _GLOBAL_RPDB_SESSION is None:
+        _GLOBAL_RPDB_SESSION = RpdbSession(*args, **kwargs)
+
+    return _GLOBAL_RPDB_SESSION
+
+
 class RpdbSession(object):
     """Network session for rpdb."""
     def __init__(self, addr, port):
+        self._addr = addr
+        self._port = port
+        self.skt = None
+
+    def init(self):
+        if self.skt:
+            return True
+
+        global OCCUPIED
+
         # Backup stdin and stdout before replacing them by the socket handle
         self.old_stdout = sys.stdout
         self.old_stdin = sys.stdin
-        self.port = port
 
-        # Open a 'reusable' socket to let the debugging session reuse the port
-        self.skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
-        self.skt.bind((addr, port))
-        self.skt.listen(1)
+        try:
+            # Open a 'reusable' socket to let the debugging session reuse the port
+            self.skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+            self.skt.bind((self._addr, self._port))
+            self.skt.listen(1)
+        except socket.error:
+            if OCCUPIED.is_claimed(self._port, sys.stdout):
+                # rpdb is already on this port - good enough, let it go on:
+                _logger.info("Recurrent rpdb invocation ignored")
+                return False
+            else:
+                # Port occupied by something else.
+                raise
 
-        # Writes to stdout are forbidden in mod_wsgi environments
         _logger.info("session created on %s:%d", *self.skt.getsockname())
 
         (clientsocket, _) = self.skt.accept()
         self.handle = clientsocket.makefile('rw')
         sys.stdout = sys.stdin = self.handle
-        OCCUPIED.claim(port, self.handle)
+        OCCUPIED.claim(self._port, self.handle)
+        return True
 
     def shutdown(self):
         """Revert stdin and stdout, close the socket."""
+        global OCCUPIED
+
         if self.old_stdout and self.old_stdin:
             sys.stdout = self.old_stdout
             sys.stdin = self.old_stdin
-        if self.port:
-            OCCUPIED.unclaim(self.port)
-        if self.skt:
-            _logger.debug("session ending")
-            self.skt.close()
+            self.old_stdout = None
+            self.old_stdin = None
 
-        self.old_stdout = None
-        self.old_stdin = None
-        self.skt = None
-        self.port = None
+        try:
+            if self.handle:
+                try:
+                    self.handle.close()
+                except Exception as e:
+                    _logger.exception(e)
+                    _logger.debug("Failed to close handle")
+                finally:
+                    self.handle = None
+
+                if self.skt:
+                    try:
+                        _logger.debug("session ending")
+                        self.skt.shutdown(socket.SHUT_RDWR)
+                        self.skt.close()
+                    except Exception as e:
+                        _logger.exception(e)
+                        _logger.debug("Failed to close socket")
+                    finally:
+                        self.skt = None
+        finally:
+            _logger.info("Current port is: %d" % self._port)
+            if self._port:
+                OCCUPIED.unclaim(self._port)
+                self._port = None
+
+
+def finally_shutdown(session, method):
+    def _wrapper(*args, **kwargs):
+        try:
+            _logger.info("in wrapper")
+            return method(*args, **kwargs)
+        finally:
+            session.shutdown()
+            # raise RuntimeError("Calling shutdown!!")
+    return _wrapper
 
 
 class Rpdb(object):
@@ -87,6 +152,9 @@ class Rpdb(object):
         self.pdb = pdb.Pdb(completekey='tab',
                            stdin=UnifiedObjects(self._session.handle, self._session.old_stdin),
                            stdout=UnifiedObjects(self._session.handle, self._session.old_stdout))
+        self.pdb.do_continue = finally_shutdown(session, self.pdb.do_continue)
+        self.pdb.do_quit = finally_shutdown(session, self.pdb.do_quit)
+        self.pdb.do_EOF = finally_shutdown(session, self.pdb.do_EOF)
 
         _logger.debug("new PDB instance")
 
@@ -96,36 +164,23 @@ class Rpdb(object):
         return self.__getattribute__(name)
 
 
-_GLOBAL_RPDB_SESSION = None
-
-
 def set_trace(addr=DEFAULT_ADDR, port=DEFAULT_PORT, frame=None, maintain_session=True):
     """Wrapper function to keep the same import x; x.set_trace() interface.
 
     We catch all the possible exceptions from pdb and cleanup.
     """
-    global _GLOBAL_RPDB_SESSION
-    if maintain_session:
-        if _GLOBAL_RPDB_SESSION is None:
-            _GLOBAL_RPDB_SESSION = RpdbSession(addr=addr, port=port)
-        session = _GLOBAL_RPDB_SESSION
-    else:
-        session = RpdbSession(addr=addr, port=port)
+    session = new_session(addr=addr, port=port, ephemeral=(not maintain_session))
 
-    try:
-        debugger = Rpdb(session)
-    except socket.error:
-        if OCCUPIED.is_claimed(port, sys.stdout):
-            # rpdb is already on this port - good enough, let it go on:
-            sys.stdout.write("(Recurrent rpdb invocation ignored)\n")
-            return
-        else:
-            # Port occupied by something else.
-            raise
+    if not session.init():
+        return
+
+    debugger = Rpdb(session)
     try:
         debugger.set_trace(frame or sys._getframe().f_back)
-    except Exception:
+    except Exception as e:
+        _logger.exception(e)
         traceback.print_exc()
+    # no code can go here or it will interfere with the debugger
 
 
 def _trap_handler(addr, port, _, frame):
@@ -138,15 +193,17 @@ def handle_trap(addr=DEFAULT_ADDR, port=DEFAULT_PORT):
     signal.signal(signal.SIGTRAP, partial(_trap_handler, addr, port))
 
 
-def post_mortem(addr=DEFAULT_ADDR, port=DEFAULT_PORT):
+def post_mortem(addr=DEFAULT_ADDR, port=DEFAULT_PORT, maintain_session=False):
     """Post mortem handler.
 
     Place this in a try/except handler.
     """
-    session = RpdbSession(addr=addr, port=port)
+    session = new_session(addr=addr, port=port, ephemeral=(not maintain_session))
+    if not session.init():
+        return
     debugger = Rpdb(session)
     _, _, tb = sys.exc_info()
-    traceback.print_exc()
+    traceback.print_exc(file=session.handle)
     debugger.reset()
     debugger.interaction(None, tb)
 
@@ -178,6 +235,7 @@ class OccupiedPorts(object):
     def unclaim(self, port):
         """Release a (port, handle) pair."""
         with self.lock:
+            _logger.info("releasing %d:%d" % (port, self.claims[port]))
             del self.claims[port]
 
 # {port: sys.stdout} pairs to track recursive rpdb invocation on same port.
