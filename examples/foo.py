@@ -14,7 +14,7 @@ if not logger.handlers:
 def main():
     count = 0
     while count < 10:
-        rpdb.set_trace()
+        rpdb.set_trace(long_living=True)
         print("here %d" % count)
         count += 1
 

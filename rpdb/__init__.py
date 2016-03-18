@@ -1,11 +1,14 @@
 """Remote Python Debugger (pdb wrapper)."""
 
 __author__ = "Bertrand Janin <b@janin.com>"
-__version__ = "0.1.6"
+__version__ = "0.1.6.shaleh"
+
+__all__ = ('Rpdb', 'handle_trap', 'post_mortem', 'set_trace')
 
 from functools import partial
 import logging
 import pdb
+import readline
 import signal
 import socket
 import sys
@@ -26,16 +29,16 @@ class FileObjectWrapper(object):
 
     def __getattr__(self, attr):
         if hasattr(self._obj, attr):
-            attr = getattr(self._obj, attr)
-        elif hasattr(self._io, attr):
-            attr = getattr(self._io, attr)
-        else:
-            raise AttributeError("Attribute %s is not found" % attr)
-        return attr
+            return getattr(self._obj, attr)
+        if hasattr(self._io, attr):
+            return getattr(self._io, attr)
+
+        # this mimics standard Python behavior
+        return self.__getattribute__(attr)
 
 
 def finally_shutdown(owner, method):
-    """Wrapper to a clean-up happens after `method` is called."""
+    """Wrapper to ensure clean-up happens after `method` is called."""
     def _wrapper(*args, **kwargs):
         """Clean-up after calling method."""
         try:
@@ -45,45 +48,38 @@ def finally_shutdown(owner, method):
     return _wrapper
 
 
-class Rpdb(object):
-    """Wrap a Pdb object with a remote session."""
-
-    def __init__(self, addr=DEFAULT_ADDR, port=DEFAULT_PORT):
-        # Backup stdin and stdout before replacing them by the socket handle
-        self.old_stdout = sys.stdout
-        self.old_stdin = sys.stdin
+class RemoteSession(object):
+    def __init__(self, addr, port, long_living=False):
         self.port = port
+        self.handle = None
+        self.long_living = long_living
 
-        # Open a 'reusable' socket to let the webapp reload on the same port
+        # Open a 'reusable' socket prevent errors when the socket is reopened
+        # before the last session has fully timed out.
         self.skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         self.skt.bind((addr, port))
         self.skt.listen(1)
 
-        _logger.info("pdb is running on %s:%d" % self.skt.getsockname())
+        _logger.info("remote session is running on %s:%d" % self.skt.getsockname())
 
-        self._pdb = None
+    def begin(self):
+        if OCCUPIED.is_claimed(self.port, self.handle):
+            return  # already active
 
-    def start_debugger(self):
-        """Accept external connections and run Pdb."""
-        (clientsocket, address) = self.skt.accept()
-        handle = clientsocket.makefile('rw')
-        self._pdb = pdb.Pdb(completekey='tab',
-                            stdin=FileObjectWrapper(handle, self.old_stdin),
-                            stdout=FileObjectWrapper(handle, self.old_stdout))
-        # wrap the methods that need extra logic
-        for method in ('do_continue', 'do_c', 'do_cont',
-                       'do_quit', 'do_exit', 'do_q',
-                       'do_EOF'):
-            setattr(self._pdb, method, finally_shutdown(self, getattr(self._pdb, method)))
+        (clientsocket, _) = self.skt.accept()
+        self.handle = clientsocket.makefile('rw')
+        # Backup stdin and stdout before replacing them by the socket handle
+        self.old_stdout = sys.stdout
+        self.old_stdin = sys.stdin
+        self.stdout = FileObjectWrapper(self.handle, self.old_stdout)
+        self.stdin = FileObjectWrapper(self.handle, self.old_stdin)
+        sys.stdout = self.stdout
+        sys.stdin = self.stdin
 
-        sys.stdout = sys.stdin = handle
-        self.handle = handle
         OCCUPIED.claim(self.port, self.handle)
-        _logger.debug("pdb client connected")
 
     def shutdown(self):
-        """Revert stdin and stdout, close the socket."""
         sys.stdout = self.old_stdout
         sys.stdin = self.old_stdin
         self.handle.close()
@@ -91,21 +87,63 @@ class Rpdb(object):
         self.skt.shutdown(socket.SHUT_RDWR)
         self.skt.close()
 
+
+class Rpdb(object):
+    """Wrap a Pdb object with a remote session."""
+
+    _long_lived_session = None
+
+    @classmethod
+    def new_session(cls, addr=DEFAULT_ADDR, port=DEFAULT_PORT, long_living=False):
+        if long_living:
+            if not cls._long_lived_session:
+                cls._long_lived_session = RemoteSession(addr=addr, port=port, long_living=long_living)
+            return cls._long_lived_session
+        elif cls._long_lived_session.skt is not None:
+            _logger.debug("pdb session already active, reusing it.")
+            return cls._long_lived_session
+        return RemoteSession(addr=addr, port=port)
+
+    def __init__(self, session):
+        self._session = session
+        self._pdb = None
+
+    def start_debugger(self):
+        """Accept external connections and run Pdb."""
+        self._session.begin()
+
+        self._pdb = pdb.Pdb(completekey='tab',
+                            stdin=self._session.stdin,
+                            stdout=self._session.stdout)
+        # wrap the methods that need extra logic
+        for method in ('do_continue', 'do_c', 'do_cont',
+                       'do_quit', 'do_exit', 'do_q',
+                       'do_EOF'):
+            setattr(self._pdb, method, finally_shutdown(self, getattr(self._pdb, method)))
+
+        _logger.debug("pdb client connected")
+
+    def shutdown(self):
+        """Revert stdin and stdout, close the socket."""
+        if not self._session.long_living:
+            self._session.shutdown()
+
     def __getattr__(self, name):
         """Pass on requests to the Pdb object."""
         if hasattr(self._pdb, name):
             return getattr(self._pdb, name)
-        return self.__getattribute__(self, name)
+        return self.__getattribute__(name)
 
 
-def set_trace(addr=DEFAULT_ADDR, port=DEFAULT_PORT, frame=None):
+def set_trace(addr=DEFAULT_ADDR, port=DEFAULT_PORT, frame=None, long_living=False):
     """Wrapper function to keep the same import x; x.set_trace() interface.
 
     We catch all the possible exceptions from pdb and cleanup.
 
     """
     try:
-        debugger = Rpdb(addr=addr, port=port)
+        session = Rpdb.new_session(addr=addr, port=port, long_living=long_living)
+        debugger = Rpdb(session)
         debugger.start_debugger()
     except socket.error:
         if OCCUPIED.is_claimed(port, sys.stdout):
@@ -131,16 +169,20 @@ def handle_trap(addr=DEFAULT_ADDR, port=DEFAULT_PORT):
 
 
 def post_mortem(addr=DEFAULT_ADDR, port=DEFAULT_PORT):
-    debugger = Rpdb(addr=addr, port=port)
+    # capture the existing exception before creating the debugger in case
+    # another exception is thrown
     type, value, tb = sys.exc_info()
     traceback.print_exc()
+
+    session = Rpdb.new_session(addr=addr, port=port, long_living=False)
+    debugger = Rpdb(session)
     debugger.start_debugger()
     debugger.reset()
     debugger.interaction(None, tb)
 
 
 class OccupiedPorts(object):
-    """Maintain rpdb port versus stdin/out file handles.
+    """Maintain rpdb port to file handle mappings.
 
     Provides the means to determine whether or not a collision binding to a
     particular port is with an already operating rpdb session.
