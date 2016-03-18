@@ -3,14 +3,14 @@
 __author__ = "Bertrand Janin <b@janin.com>"
 __version__ = "0.1.6"
 
+from functools import partial
 import logging
 import pdb
-import socket
-import threading
 import signal
+import socket
 import sys
+import threading
 import traceback
-from functools import partial
 
 _logger = logging.getLogger(__name__)
 _logger.addHandler(logging.NullHandler())
