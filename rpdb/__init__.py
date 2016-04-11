@@ -79,7 +79,7 @@ class RemoteSession(object):
         OCCUPIED.claim(self.port, self.handle)
 
     def shutdown(self):
-        _logger.info("remote session completed: %d:%d" % (self.port, self.handle))
+        _logger.info("remote session completed: {}:{}".format(self.port, self.handle))
         sys.stdout = self.old_stdout
         sys.stdin = self.old_stdin
         self.handle.close()
