@@ -98,10 +98,10 @@ class Rpdb(object):
         if long_living:
             if not cls._long_lived_session:
                 cls._long_lived_session = RemoteSession(addr=addr, port=port, long_living=long_living)
-            return cls._long_lived_session
-        elif cls._long_lived_session.skt is not None:
-            _logger.debug("pdb session already active, reusing it.")
-            return cls._long_lived_session
+                return cls._long_lived_session
+            elif cls._long_lived_session.skt is not None:
+                _logger.debug("pdb session already active, reusing it.")
+                return cls._long_lived_session
         return RemoteSession(addr=addr, port=port)
 
     def __init__(self, session):
